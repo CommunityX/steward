@@ -18,32 +18,47 @@
  * An order that fails or does not show in the queue is tried again after a
  * while and never pauses the run: only missing resources do.
  *
- * Apply sends the items of the trip one grid per round, and only while a
- * running quest wants the item (core/quests.js itemWant with opts.running):
- * a quest that is unread, not yet started or in any mode other than running
- * is never sent to, and the wait for it is logged once. A quest also wants
- * the item when its open type-1 trigger, not a click trigger, names the
- * building standing at the grid: such a quest takes the item without naming
- * it. So does its open item-action end condition (onmap, buildingdestroyed)
- * naming that building, as a quest that asks for the boulders dynamite
- * clears. The want is asked per grid: a grid whose quest condition is met is
- * skipped on its own while the item's other grids still go. Each grid has a
- * persisted send marker, so a reload never sends to it twice. An item's
- * amount is its total for the trip over all its grids (an item without one
- * takes 1 per grid). The game may take less than it is offered, so only the
- * stock drop of a verified send counts: a seen 'part:' marker records what
- * each grid has taken so far, and while the item's grids together are short
- * of the amount the grid stays open and the rest is offered to the same grid
- * next, until the item has taken the amount, the quest no longer wants the
- * item, a send shows no drop at all (the grid was already full), or the
- * building first seen at the grid is gone or being destroyed after the grid
- * took something (nothing is left there to take more). Out of stock, Apply
+ * Apply sends each item of the trip as one burst: one action sends the
+ * item to all its open grids back to back, from one star-menu entry, with
+ * nothing in between, as the game takes an item best when its grids get it
+ * together. It sends only while a running quest wants the item
+ * (core/quests.js itemWant with opts.running): a quest that is unread, not
+ * yet started or in any mode other than running is never sent to, and the
+ * wait for it is logged once. A quest also wants the item when its open
+ * type-1 trigger, not a click trigger, names the building standing at the
+ * grid: such a quest takes the item without naming it. So does its open
+ * item-action end condition (onmap, buildingdestroyed) naming that
+ * building, as a quest that asks for the boulders dynamite clears. The want
+ * is asked per grid: a grid whose quest condition is met is skipped on its
+ * own, a grid whose quest is not running yet is left for a later burst, and
+ * the item's other grids still go. Each grid has a persisted send marker,
+ * written before the first packet, so a reload never sends to it twice.
+ * The burst's check reads the stock only BURST_GAP_MS after the send, and
+ * the next burst of the trip goes out no sooner than BURST_GAP_MS after the
+ * latest send marker, so the server has finished with one item before the
+ * next arrives, after a reload too. An item's amount is its total for the
+ * trip over all its grids: every grid of the burst is offered what the
+ * trip still needs of it, the game takes only what each grid needs, and the
+ * burst needs one stack holding that offer (each packet draws on the same
+ * entry). A total stock below it goes home for more; stock split over
+ * stacks pauses before any packet. An item without an amount offers 1 per
+ * grid, and its burst is cut to the largest stack. Only the total stock
+ * drop of a verified burst is known, so it goes on the 'part:' marker of
+ * the burst's first grid (the item's part markers sum to what the trip has
+ * taken of it). A verified burst closes all its grids whatever it took: a
+ * short take is logged as a warning and nothing more is offered. The
+ * buildings read when the burst is decided go with it: the action may run
+ * later, and when another building stands at any of its grids by then
+ * nothing is sent and the next round decides again. Every burst logs one
+ * 'item ... entries' line per grid (star-menu entries, the building and the
+ * item's targets) and one 'apply' line; core logs the packet times in its
+ * 'burst' line. Out of stock, Apply
  * first sends the other items a running quest wants that are in stock; a
  * grid the out-of-stock item still owes is held back from every later item,
  * so the file order on a shared grid holds. Once nothing else can go the run
  * goes home for more and comes back to the same trip, rather than wait on
- * items no running quest wants yet. A send that made no host call (nothing
- * went out) keeps its grid open and is tried again after NOT_SENT_RETRY_MS,
+ * items no running quest wants yet. A burst that made no host call (nothing
+ * went out) keeps its grids open and is tried again after NOT_SENT_RETRY_MS,
  * up to NOT_SENT_MAX times per grid, then pauses. An item with a quest
  * (item.quest) is wanted only by that quest, which must also pass the
  * client's own IsRunning(): the grid's building alone cannot tell which
@@ -88,13 +103,15 @@
     var TRIP_REVISITS    = 2;        // re-visits per trip before a pause
     var NOT_SENT_MAX     = 3;        // no-packet sends per grid before a pause
     var NOT_SENT_RETRY_MS = 10000;   // gap after a no-packet send before the next try to that grid
+    var BURST_GAP_MS     = 15000;    // an item burst's check waits this long, and the next burst goes out no sooner
 
     var CATEGORY = 'adventures';
 
     // Mark name prefixes: one mark per item ordered, one per grid sent to,
     // and one per grid that took something (written seen, never sent; its
-    // taken field is what the grid has taken so far, so the item's part
-    // marks together hold what the trip has taken of it). One
+    // taken field is what the grid has taken so far, and a burst's whole take
+    // goes on its first grid, so the item's part marks together hold what the
+    // trip has taken of it). One
     // per trip holds Produce's verdict that the next trip waits for
     // resources (seen, its text the shortfall), since the island cannot read
     // the home queues; one per trip counts the re-visits taken (seen, count).
@@ -179,12 +196,6 @@
 
     function partMark(r, buff, grid) {
         return gridName(PART, r.trip, buff, grid);
-    }
-
-    // The part mark that belongs to an apply mark: the same trip, buff and
-    // grid under the other prefix.
-    function partOf(applyName) {
-        return PART + applyName.slice(APPLY.length);
     }
 
     // { buff, grid } of an apply mark name. The grid follows the last ':',
@@ -485,6 +496,44 @@
         return { b: b, cur: cur, first: first };
     }
 
+    // The diagnostic line of an item send, from s (gridSeen of the grid): the
+    // star-menu entries of the item, the building and what the item's
+    // definition targets. A refused or refunded send can then be read from
+    // the log later. Text only, and every read is guarded so it never throws.
+    function sendNote(b, grid, s) {
+        var ents = [];
+        try {
+            var inv = S.core.buffs.inventory() || [];
+            for (var i = 0; i < inv.length; i++) {
+                if (inv[i].type !== b || (inv[i].resource || '') !== '') continue;
+                ents.push(inv[i].bad ? '?' : inv[i].amount + '[' + (inv[i].uid || '') + ']');
+            }
+        } catch (e) {
+            ents = ['?'];
+        }
+        var own = null;
+        var nb = null;
+        var des = null;
+        try { own = S.core.buildings.grid(s.b); } catch (e2) { own = null; }
+        try {
+            var bs = S.core.buildings.buffState(s.b);
+            nb = bs ? bs.buffsVector : null;
+        } catch (e3) { nb = null; }
+        try { des = S.core.buildings.inDestruction(s.b); } catch (e4) { des = null; }
+        var tgt = null;
+        try { tgt = S.core.buffs.adventureTarget(b, s.cur); } catch (e5) { tgt = null; }
+        var targets = tgt && tgt.targets && tgt.targets.length ? tgt.targets.join(',') : 'none';
+        var group = tgt && tgt.group ? tgt.group : 'none';
+        var via = !tgt ? '?' : (!s.cur ? '-' : (tgt.via || 'no'));
+        return 'item ' + b + ' -> ' + grid + ': entries ' + (ents.length ? ents.join(',') : 'none') +
+            '; building ' + (s.cur || 'none') +
+            (s.first && s.first !== s.cur ? ' (first seen ' + s.first + ')' : '') +
+            ' grid ' + (own === null ? '?' : own) +
+            ', buffs ' + (typeof nb === 'number' ? nb : '?') +
+            ', in destruction ' + (des === true ? 'true' : (des === false ? 'false' : '?')) +
+            '; targets ' + targets + ' group ' + group + ' via ' + via;
+    }
+
     // Whether the building first seen at grid is gone: no named building
     // stands there now, or the one there is being destroyed. A grid never
     // named on this run and trip is never gone, since there is nothing to
@@ -493,17 +542,11 @@
         var s = gridSeen(r, grid);
         if (!s.first) return false;
         if (s.cur === '') return true;
-        var bs = null;
         try {
-            bs = S.core.buildings.buffState(s.b);
+            return S.core.buildings.inDestruction(s.b) === true;
         } catch (e) {
-            bs = null;
+            return false;
         }
-        var list = bs && bs.blockers ? bs.blockers : [];
-        for (var i = 0; i < list.length; i++) {
-            if (list[i].method === 'IsInDestruction' && list[i].value === true) return true;
-        }
-        return false;
     }
 
     // What grid has taken of buff on this trip so far (its part mark).
@@ -578,45 +621,32 @@
         return out.join('; ');
     }
 
-    // A top-up send to a grid that took less than the amount before (a
-    // stock-capped send, or a remainder after a short take) and then shows no
-    // stock drop at all: the grid was already full. Counted done without a
-    // pause, and the round dropped so the stale wait and settleRound never
-    // see it.
-    function topUpNotTaken(r) {
-        var round = ld().currentRound(r, S.RunStep.Apply);
-        if (!round || !ld().complete(round)) return;
-        var keys = [];
-        for (var k in round.expected) {
-            if (!has(round.expected, k)) continue;
-            var res = ld().resultOf(round, k);
-            if (!res || res.status === S.ActionResult.Verified) continue;
-            if (res.unseen !== true || k.indexOf(APPLY) !== 0) return;
-            var pm = ld().marked(r, partOf(k));
-            if (!pm || !pm.seen) return;
-            keys.push(k);
+    // When the latest burst of this trip went out: the largest sentAt over
+    // the trip's apply marks, else null. The marks are written before the
+    // first packet and persist, so the gap to the next burst holds after a
+    // reload; a burst that sent nothing gave its sentAt back and counts not.
+    function lastBurstAt(r) {
+        var pre = APPLY + r.trip + ':';
+        var last = null;
+        for (var name in (r.marks || {})) {
+            if (!has(r.marks, name) || name.indexOf(pre) !== 0) continue;
+            var t = r.marks[name].sentAt;
+            if (typeof t === 'number' && (last === null || t > last)) last = t;
         }
-        if (!keys.length) return;
-        for (var i = 0; i < keys.length; i++) {
-            var p = parseApply(keys[i]);
-            ld().markSeen(r, keys[i]);
-            log(p.buff + ' -> ' + p.grid + ': took nothing more; grid done');
-        }
-        st().dropRound('top-up not taken');
+        return last;
     }
 
-    // The onDone follow-up of a send, on the current run like seenOnVerified.
-    // Only a verified send decides here; the step reads any other result.
-    // took is the stock drop the send's check saw, plus the queued items that
-    // landed in the star menu during the send, which raised the stock. given
-    // is what the grid had taken before this send, and before what the goal
-    // (the item's trip total, or the grid's 1) had got by then. Every take is
-    // added to the grid's part mark, so the item's marks sum to its trip
-    // total. A send that met the goal is done; one still short stays open, so
-    // the next round offers the rest, unless the grid took all it was offered
-    // and its building is gone (nothing left there to take more). A take of
-    // nothing ends the grid as before, so a grid is never offered forever.
-    function applied(name, part, b, grid, offered, goal, before, given, q0, def) {
+    // The onDone follow-up of a burst, on the current run like
+    // seenOnVerified. Only a verified burst decides here; the step reads any
+    // other result. took is the stock drop the check saw, plus the queued
+    // items that landed in the star menu during the burst, which raised the
+    // stock. Only the burst's total is known, not what each grid took, so it
+    // is added to the part mark of the first grid (given0 is what that grid
+    // had taken before), and the item's part marks still sum to its trip
+    // take. Every grid of the burst is done whatever it took: each grid takes
+    // only what it needs, and a grid offered again after a burst took nothing
+    // in nearly every case seen, so nothing is offered twice.
+    function burstApplied(names, b, grids, offer, goal, firstPart, given0, q0, def) {
         return function (result, cur) {
             if (!result || result.status !== S.ActionResult.Verified) return;
             var took = def.dropped();
@@ -624,33 +654,25 @@
             if (typeof took === 'number' && typeof q0 === 'number' && typeof q1 === 'number' && q1 < q0) {
                 took += q0 - q1;
             }
+            var where = b + ' burst x' + offer + ' -> ' + grids.join(',');
+            var i;
             if (took === null || !(took > 0)) {
-                ld().markSeen(cur, name);
-                log(b + ' -> ' + grid + ': took ' + took + ' of ' + offered + '; grid done');
+                for (i = 0; i < names.length; i++) ld().markSeen(cur, names[i]);
+                log(where + ': took ' + took + '; ' + grids.length + ' grid(s) done');
                 return;
             }
-            ld().markSeen(cur, part);
-            ld().marked(cur, part).taken = given + took;
-            st().save();
-            var sofar = before + took;
-            if (sofar >= goal) {
-                ld().markSeen(cur, name);
-                log(b + ' -> ' + grid + ': took ' + took + ' of ' + offered + '; grid done');
+            ld().markSeen(cur, firstPart);
+            ld().marked(cur, firstPart).taken = given0 + took;
+            for (i = 0; i < names.length; i++) ld().markSeen(cur, names[i]);
+            var text = where + ': took ' + took + ' of ' + goal +
+                (took > goal ? ' (more than the ' + goal + ' needed)' : '') +
+                '; ' + grids.length + ' grid(s) done';
+            if (took < goal) {
+                S.kernel.warn(CATEGORY, st().label() + ': ' + text +
+                    '; the grids took what they needed, nothing more is sent');
                 return;
             }
-            if (took >= offered && buildingGone(cur, grid)) {
-                ld().markSeen(cur, name);
-                log(b + ' -> ' + grid + ': took all ' + offered + ' offered; building gone, grid done');
-                return;
-            }
-            ld().dropMark(cur, name);
-            if (took >= offered) {
-                log(b + ' -> ' + grid + ': took all ' + offered + ' offered (' + sofar + ' of ' + goal +
-                    ' so far); grid stays open');
-            } else {
-                log(b + ' -> ' + grid + ': took ' + took + ' of ' + offered + ', ' + sofar + ' of ' + goal +
-                    ' so far; sending the other ' + (goal - sofar));
-            }
+            log(text);
         };
     }
 
@@ -665,8 +687,24 @@
         return !!objs && !objs.length;
     }
 
-    // Apply (island). One grid per round, so each check reads the stock drop
-    // of its own send.
+    // The grids of the burst that buff's failed Apply round expected, from
+    // its apply mark keys, so a pause names every grid the burst was for.
+    // fallback is the failed key's grid.
+    function burstGrids(r, buff, fallback) {
+        var round = ld().currentRound(r, S.RunStep.Apply);
+        var out = [];
+        if (round) {
+            for (var k in round.expected) {
+                if (!has(round.expected, k) || k.indexOf(APPLY) !== 0) continue;
+                var p = parseApply(k);
+                if (p.buff === buff) out.push(p.grid);
+            }
+        }
+        return out.length ? out.join(',') : fallback;
+    }
+
+    // Apply (island). One burst per round, so its check reads the stock drop
+    // of that burst alone.
     function apply(r) {
         var RS = S.RunStep;
         if (!islandViewed(r)) return;
@@ -676,9 +714,6 @@
             st().go(RS.Trip, 'visit only');
             return;
         }
-        // Before any stale wait, so a top-up that took nothing never waits
-        // the order time or pauses.
-        topUpNotTaken(r);
 
         var open = isOpen(r, r.trip);
         var openOf = [];
@@ -703,8 +738,6 @@
             return;
         }
 
-        // A grid re-opened after a short or capped send has no apply mark, so it is
-        // not pending and its round is dropped as shown, not counted.
         ld().dropShown(r, RS.Apply, pending);
         for (i = 0; i < pending.length; i++) {
             var pp = parseApply(pending[i]);
@@ -729,7 +762,8 @@
 
         var next = ld().settleRound(r, RS.Apply, function (f) {
             var fp = f.key.indexOf(APPLY) === 0 ? parseApply(f.key) : { buff: f.key, grid: '?' };
-            st().pause(S.RunPause.BuffFailed, 'apply ' + fp.buff + ' to ' + fp.grid + ' failed: ' + f.reason);
+            st().pause(S.RunPause.BuffFailed, 'apply ' + fp.buff + ' to ' + burstGrids(r, fp.buff, fp.grid) +
+                ' failed: ' + f.reason);
         }, 'item apply');
         if (next !== 'new') return;
 
@@ -740,6 +774,15 @@
         // close a grid for good, so nothing is decided.
         if (questSettling(r)) {
             ld().waitBusy(r, null, 'waiting for the quests to settle after a quest read or claim');
+            return;
+        }
+        // The server is given BURST_GAP_MS after a burst before the next one;
+        // the burst's own check usually covers it, a reload or a burst that
+        // sent nothing does not.
+        var lb = lastBurstAt(r);
+        if (lb !== null && now() - lb < BURST_GAP_MS) {
+            ld().waitBusy(r, null, 'waiting ' + Math.ceil((BURST_GAP_MS - (now() - lb)) / 1000) +
+                ' s after the last item burst');
             return;
         }
 
@@ -756,9 +799,11 @@
             var buff = items[i].buff;
             // Asked per grid: a quest matched by the building at the grid
             // can be done for one boulder kind while the item's grids of
-            // another kind are still wanted, so a done grid skips only itself.
-            var wants = 'done';
-            var at = null;
+            // another kind are still wanted, so a done grid skips only itself,
+            // and a grid whose quest is not running yet waits for a later
+            // burst while the open ones go now.
+            var burst = [];
+            var later = [];
             var skipped = 0;
             var doneHere = {};
             for (g = 0; g < openOf[i].length; g++) {
@@ -770,37 +815,82 @@
                     continue;
                 }
                 if (w2 === null) {
-                    wants = null;
-                    break;
-                }
-                if (has(blocked, openOf[i][g])) continue;
-                wants = w2;
-                at = openOf[i][g];
-                break;
-            }
-            if (skipped) log('quest no longer wants ' + buff + '; ' + skipped + ' grid(s) skipped');
-            if (wants === null) {
-                ld().waitRead(r, 'quests');
-                return;
-            }
-            if (at === null) continue;
-            if (wants === 'open') {
-                var have = S.core.buffs.stock(buff, '');
-                if (typeof have !== 'number') {
-                    ld().waitRead(r, 'item stock');
+                    ld().waitRead(r, 'quests');
                     return;
                 }
-                if (have > 0) {
-                    target = { item: items[i], grid: at, stock: have };
-                    break;
+                if (has(blocked, openOf[i][g])) continue;
+                if (w2 === 'open') burst.push(openOf[i][g]);
+                else later.push(openOf[i][g]);
+            }
+            if (skipped) log('quest no longer wants ' + buff + '; ' + skipped + ' grid(s) skipped');
+            if (!burst.length) {
+                if (later.length && waitItem === null) waitItem = items[i];
+                continue;
+            }
+            var sk = S.core.buffs.stack(buff, '');
+            if (!sk || typeof sk.total !== 'number') {
+                ld().waitRead(r, 'item stock');
+                return;
+            }
+            var largest = typeof sk.largest === 'number' ? sk.largest : sk.total;
+            var isShort = false;
+            var t = null;
+            if (items[i].amount !== null) {
+                // Every packet of the burst offers what the trip still needs
+                // and draws on the same entry, so one stack must hold it.
+                var remaining = stillNeeded(r, items[i], burst[0]);
+                if (remaining <= 0) {
+                    for (g = 0; g < burst.length; g++) ld().markSeen(r, applyMark(r, buff, burst[g]));
+                    log(buff + ': amount already taken; ' + burst.length + ' grid(s) done');
+                    return;
                 }
-                shorts.push({ buff: buff, left: openOf[i].length - skipped });
+                if (sk.total < remaining) {
+                    isShort = true;
+                } else if (largest < remaining) {
+                    st().pause(S.RunPause.BuffFailed, 'apply ' + buff + ' to ' + burst.join(',') +
+                        ' failed: no single stack of ' + remaining + ' (largest ' + largest + ', stock ' +
+                        sk.total + '); a burst sends from one stack');
+                    return;
+                } else {
+                    t = { item: items[i], grids: burst, offer: remaining, need: remaining, cut: null };
+                }
+            } else {
+                // 1 per grid, at most as many grids as the largest stack holds,
+                // so the entry never runs dry in the middle of the burst.
+                var still = [];
+                var full = 0;
+                for (g = 0; g < burst.length; g++) {
+                    if (stillNeeded(r, items[i], burst[g]) > 0) {
+                        still.push(burst[g]);
+                        continue;
+                    }
+                    ld().markSeen(r, applyMark(r, buff, burst[g]));
+                    full++;
+                }
+                if (full) {
+                    log(buff + ': ' + full + ' grid(s) already took theirs; grid(s) done');
+                    return;
+                }
+                if (!(largest > 0)) {
+                    isShort = true;
+                } else {
+                    var cut = still.slice(0, Math.min(still.length, largest));
+                    t = { item: items[i], grids: cut, offer: 1, need: cut.length,
+                        cut: cut.length < still.length ? still.length : null };
+                }
+            }
+            if (isShort) {
+                shorts.push({ buff: buff, left: burst.length });
                 for (g = 0; g < openOf[i].length; g++) {
                     if (!has(doneHere, openOf[i][g])) blocked[openOf[i][g]] = true;
                 }
                 continue;
             }
-            if (waitItem === null) waitItem = items[i];
+            t.stock = sk.total;
+            t.largest = largest;
+            t.later = later;
+            target = t;
+            break;
         }
 
         // Out of a wanted item and nothing else can go: home for more now,
@@ -847,45 +937,57 @@
         }
 
         var b = target.item.buff;
-        var tg = target.grid;
-        var an = applyMark(r, b, tg);
-        // A send that made no host call left the grid open. The count resets
-        // before the pause, so a Resume gets fresh tries; the gap gives a
-        // passing bridge glitch time to clear before the next try.
-        var nm = ld().marked(r, an);
-        if (nm && nm.notSent >= NOT_SENT_MAX) {
-            nm.notSent = 0;
+        var tg = target.grids;
+        var names = [];
+        for (g = 0; g < tg.length; g++) names.push(applyMark(r, b, tg[g]));
+        // A burst that made no host call left its grids open. The count
+        // resets before the pause, so a Resume gets fresh tries; the gap gives
+        // a passing bridge glitch time to clear before the next try.
+        var tries = false;
+        var recent = false;
+        for (g = 0; g < names.length; g++) {
+            var nm = ld().marked(r, names[g]);
+            if (nm && nm.notSent >= NOT_SENT_MAX) tries = true;
+            if (nm && typeof nm.notSentAt === 'number' && now() - nm.notSentAt < NOT_SENT_RETRY_MS) recent = true;
+        }
+        if (tries) {
+            for (g = 0; g < names.length; g++) {
+                var rm = ld().marked(r, names[g]);
+                if (rm) rm.notSent = 0;
+            }
             st().save();
-            st().pause(S.RunPause.BuffFailed, 'apply ' + b + ' to ' + tg + ' failed: nothing sent after ' +
+            st().pause(S.RunPause.BuffFailed, 'apply ' + b + ' to ' + tg.join(',') + ' failed: nothing sent after ' +
                 NOT_SENT_MAX + ' tries; see the log for the reason');
             return;
         }
-        if (nm && typeof nm.notSentAt === 'number' && now() - nm.notSentAt < NOT_SENT_RETRY_MS) {
-            ld().waitBusy(r, null, 'item ' + b + ' -> ' + tg + ' not sent, trying again');
+        if (recent) {
+            ld().waitBusy(r, null, 'item ' + b + ' -> ' + tg.join(',') + ' not sent, trying again');
             return;
         }
-        var pn = partMark(r, b, tg);
-        // What the item still needs (its trip total over all its grids, or
-        // this grid's 1); the send offers only that, so the item never gets
-        // more than its amount.
-        var goal = sc().sendAmount(target.item);
-        var given = gridTaken(r, b, tg);
-        var remaining = stillNeeded(r, target.item, tg);
-        if (remaining <= 0) {
-            ld().markSeen(r, an);
-            log(b + ' -> ' + tg + ': amount already taken; grid done');
-            return;
-        }
-        var stock = target.stock;
-        var amount = Math.min(remaining, stock);
         var q0 = S.core.production.queuedItems(b);
-        log('apply ' + b + ' x' + amount + ' -> ' + tg + ' (stock ' + stock + ')');
+        // The grids as the burst was decided on: the burst refuses (NOT_SENT)
+        // if another building stands at any of them by the time it runs.
+        // The entries lines go out here, before the action is queued, so
+        // nothing is logged between the packets.
+        var cur = [];
+        for (g = 0; g < tg.length; g++) {
+            var seen = gridSeen(r, tg[g]);
+            cur.push(seen.cur);
+            log(sendNote(b, tg[g], seen));
+        }
+        log('apply ' + b + ' x' + target.offer + ' -> ' + tg.join(',') + ' (stock ' + target.stock +
+            ', need ' + target.need +
+            (target.largest < target.stock ? ', largest ' + target.largest : '') +
+            (target.cut !== null ? ', cut to ' + tg.length + ' of ' + target.cut + ' grids' : '') +
+            (target.later.length ? '; ' + target.later.join(',') + ' left for a later burst' : '') + ')');
         // A send is progress: the next item wait starts its quiet time afresh.
         st().current().applyClock = null;
-        var def = S.core.buffs.adventureItem(b, tg, amount);
+        var def = S.core.buffs.adventureBurst(b, tg, target.offer,
+            { need: target.need, buildings: cur, quietMs: BURST_GAP_MS });
         var round = ld().startRound(r, RS.Apply, []);
-        ld().attempt(round, an, ld().wrapSend(r, an, def),
-            applied(an, pn, b, tg, amount, goal, goal - remaining, given, q0, def));
+        ld().attempt(round, names, ld().wrapSend(r, names, def),
+            burstApplied(names, b, tg, target.offer, target.need, partMark(r, b, tg[0]),
+                gridTaken(r, b, tg[0]), q0, def));
     }
 
     // Closes the open grids nothing is left to send to, before a target is
@@ -1070,7 +1172,8 @@
         TRIP_REVISITS:    TRIP_REVISITS,
         NOT_SENT_MAX:     NOT_SENT_MAX,
         NOT_SENT_RETRY_MS: NOT_SENT_RETRY_MS,
-        produce:          produce,
+        BURST_GAP_MS:     BURST_GAP_MS,
+        produce:         produce,
         apply:            apply,
         trip:             trip,
         applyMark:        applyMark,

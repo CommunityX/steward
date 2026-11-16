@@ -535,6 +535,140 @@ t.test('targetsOf is empty when the def or the method is missing', function () {
     assert.deepStrictEqual(plain(s2.buffs.targetsOf('ItemA')), []);
 });
 
+// A building stand-in the precheck can name.
+function standing(nm) {
+    return { GetBuildingName_string: function () { return nm; } };
+}
+
+function notSentWarns(s, text) {
+    return s.H.logs().filter(function (l) {
+        return l.level === 'warn' && l.category === 'buffs' && JSON.stringify(l).indexOf(text) !== -1;
+    });
+}
+
+t.test('adventureItem refuses a stock split so that no single stack holds the amount', function () {
+    var s = acting({ buffs: [
+        { type: 'ItemA', amount: 6, uid: 'a' },
+        { type: 'ItemA', amount: 4, uid: 'b' }
+    ] });
+    var res = run(s, s.buffs.adventureItem('ItemA', 7, 10));
+    assert.strictEqual(res.status, s.S.ActionResult.Refused);
+    assert.strictEqual(res.reason, 'no single stack of 10');
+    assert.strictEqual(s.sent.actions.length, 0);
+});
+
+t.test('adventureItem sends from the stack that holds the amount', function () {
+    var big = { type: 'ItemA', amount: 10, uid: 'b' };
+    var s = acting({ buffs: [{ type: 'ItemA', amount: 4, uid: 'a' }, big] });
+    s.env.onSend = function (a) { big.amount -= a.p3; };
+    var res = run(s, s.buffs.adventureItem('ItemA', 7, 10));
+    assert.strictEqual(res.status, s.S.ActionResult.Verified);
+    assert.strictEqual(s.sent.actions.length, 1);
+    assert.strictEqual(s.sent.actions[0].p3, 10);
+    assert.strictEqual(s.sent.actions[0].data.toKeyString(), 'b');
+});
+
+t.test('adventureItem: another building at the grid than the one chosen on sends nothing', function () {
+    var s = acting({ buffs: [{ type: 'ItemA', amount: 20 }] });
+    s.env.buildings[7] = standing('B');
+    s.H.clearLogs();
+    var res = run(s, s.buffs.adventureItem('ItemA', 7, 10, { building: 'A' }));
+    assert.strictEqual(res.status, s.S.ActionResult.Refused);
+    assert.strictEqual(res.reason, 'nothing sent');
+    assert.strictEqual(s.sent.actions.length, 0);
+    assert.strictEqual(notSentWarns(s, 'was A, now B').length, 1);
+});
+
+t.test('adventureItem: a building chosen but gone from the grid sends nothing', function () {
+    var s = acting({ buffs: [{ type: 'ItemA', amount: 20 }] });
+    s.H.clearLogs();
+    var res = run(s, s.buffs.adventureItem('ItemA', 7, 10, { building: 'A' }));
+    assert.strictEqual(res.status, s.S.ActionResult.Refused);
+    assert.strictEqual(res.reason, 'nothing sent');
+    assert.strictEqual(s.sent.actions.length, 0);
+    assert.strictEqual(notSentWarns(s, 'was A, now none').length, 1);
+});
+
+t.test('adventureItem: an empty grid chosen and still empty sends', function () {
+    var buff = { type: 'ItemA', amount: 20 };
+    var s = acting({ buffs: [buff] });
+    s.env.onSend = function (a) { buff.amount -= a.p3; };
+    var res = run(s, s.buffs.adventureItem('ItemA', 7, 10, { building: '' }));
+    assert.strictEqual(res.status, s.S.ActionResult.Verified);
+    assert.strictEqual(s.sent.actions.length, 1);
+});
+
+t.test('adventureItem: the building chosen still standing sends', function () {
+    var buff = { type: 'ItemA', amount: 20 };
+    var s = acting({ buffs: [buff] });
+    s.env.buildings[7] = standing('A');
+    s.env.onSend = function (a) { buff.amount -= a.p3; };
+    var res = run(s, s.buffs.adventureItem('ItemA', 7, 10, { building: 'A' }));
+    assert.strictEqual(res.status, s.S.ActionResult.Verified);
+    assert.strictEqual(s.sent.actions.length, 1);
+});
+
+t.test('adventureItem: a grid read that throws counts as no building and sends nothing', function () {
+    var s = acting({ buffs: [{ type: 'ItemA', amount: 20 }] });
+    s.S.core.buildings.byGrid = function () { throw new Error('boom'); };
+    var res = run(s, s.buffs.adventureItem('ItemA', 7, 10, { building: 'A' }));
+    assert.strictEqual(res.status, s.S.ActionResult.Refused);
+    assert.strictEqual(res.reason, 'nothing sent');
+    assert.strictEqual(s.sent.actions.length, 0);
+});
+
+t.test('adventureItem without opts reads no building', function () {
+    var buff = { type: 'ItemA', amount: 20 };
+    var s = acting({ buffs: [buff] });
+    var reads = 0;
+    s.S.core.buildings.byGrid = function () { reads++; return standing('Z'); };
+    s.env.onSend = function (a) { buff.amount -= a.p3; };
+    var res = run(s, s.buffs.adventureItem('ItemA', 7, 10));
+    assert.strictEqual(res.status, s.S.ActionResult.Verified);
+    assert.strictEqual(reads, 0);
+});
+
+t.test('stack returns the total and largest stack of exactly the type and resource', function () {
+    var s = acting({ buffs: [
+        { type: 'ItemA', amount: 6, uid: 'a' },
+        { type: 'ItemA', amount: 4, uid: 'b' },
+        { type: 'ItemA', amount: 9, resource: 'Coal', uid: 'c' },
+        { type: 'ItemB', amount: 50, uid: 'd' }
+    ] });
+    assert.deepStrictEqual(plain(s.buffs.stack('ItemA', '')), { total: 10, largest: 6 });
+    assert.deepStrictEqual(plain(s.buffs.stack('ItemA', 'Coal')), { total: 9, largest: 9 });
+    assert.deepStrictEqual(plain(s.buffs.stack('ItemZ', '')), { total: 0, largest: 0 });
+    breakStock(s);
+    assert.strictEqual(s.buffs.stack('ItemA', ''), null);
+});
+
+t.test('adventureTarget: name match, no match, and an empty definition', function () {
+    var s = setup({ buffs: [], buffDefs: {
+        Named: bdef(0, 'Bakery, IronMine'),
+        Other: bdef(0, 'Bakery'),
+        Empty: bdef(0, '')
+    } });
+    var named = plain(s.buffs.adventureTarget('Named', 'IronMine'));
+    assert.deepStrictEqual(named.targets, ['Bakery', 'IronMine']);
+    assert.strictEqual(named.group, '');
+    assert.strictEqual(named.via, 'name');
+    assert.strictEqual(s.buffs.adventureTarget('Other', 'IronMine').via, null);
+    var empty = plain(s.buffs.adventureTarget('Empty', 'IronMine'));
+    assert.deepStrictEqual(empty.targets, []);
+    assert.strictEqual(empty.group, '');
+    assert.strictEqual(empty.via, null);
+    // No building standing: nothing to relate the definition to.
+    assert.strictEqual(s.buffs.adventureTarget('Named', '').via, null);
+});
+
+t.test('adventureTarget reaches a building through the target group', function () {
+    var s = setup({ buffs: [], buffDefs: { Grouped: bdef(0, '', 'Mines') } });
+    withGroups(s);
+    assert.strictEqual(s.buffs.adventureTarget('Grouped', 'IronMine').group, 'Mines');
+    assert.strictEqual(s.buffs.adventureTarget('Grouped', 'IronMine').via, 'group');
+    assert.strictEqual(s.buffs.adventureTarget('Grouped', 'Bakery').via, null);
+});
+
 // ---- building production buffs ------------------------------------------------
 
 var Z = require('../stubs/zone');
@@ -1105,4 +1239,199 @@ t.test('mapReadRefusal names the read of a read refusal and nothing else', funct
     assert.strictEqual(s.buffs.mapStock('AdvA'), 0);
     breakStock(s);
     assert.strictEqual(s.buffs.mapStock('AdvA'), null);
+});
+
+// ---- adventure item burst -------------------------------------------------------
+
+function bursts(s) {
+    return s.H.logs().filter(function (l) {
+        return l.level === 'log' && l.category === 'buffs' && JSON.stringify(l).indexOf(' burst x') !== -1;
+    });
+}
+
+// Runs the def like run(), counting the queue steps, so a test can tell which
+// step ended the attempt.
+function runSteps(s, def) {
+    var steps = 0;
+    var doneAt = null;
+    var res = null;
+    s.S.core.actions.attempt(def, function (r) { res = r; doneAt = steps + 1; });
+    AC.drive(s.H, { onStep: function (n) { steps = n; s.stepNow = n; } });
+    return { res: res, steps: steps, doneAt: doneAt };
+}
+
+// takes: what the game takes per packet (the grids need less than the offer); default the offer.
+function burstWorld(amount, takes) {
+    var buff = { type: 'ItemA', amount: amount, uid: 'a' };
+    var s = acting({ buffs: [buff] });
+    s.stepNow = 0;
+    s.sendSteps = [];
+    s.env.onSend = function (a) {
+        buff.amount -= takes ? takes[s.sendSteps.length] : a.p3;
+        s.sendSteps.push(s.stepNow);
+    };
+    s.buff = buff;
+    return s;
+}
+
+t.test('adventureBurst sends one action-61 packet per grid in grid order, all in the first step', function () {
+    var s = burstWorld(10, [4, 3, 2, 1]);
+    var def = s.buffs.adventureBurst('ItemA', [7, 8, 9, 10], 10, { need: 10 });
+    assert.strictEqual(def.label, 'item ItemA x10 -> 7,8,9,10');
+    def.retries = 0;
+    var r = runSteps(s, def);
+    assert.strictEqual(r.res.status, s.S.ActionResult.Verified);
+    assert.strictEqual(r.res.sends, 1);
+    assert.strictEqual(s.sent.actions.length, 4);
+    for (var i = 0; i < 4; i++) {
+        assert.strictEqual(s.sent.actions[i].id, 61);
+        assert.strictEqual(s.sent.actions[i].p2, [7, 8, 9, 10][i]);
+        assert.strictEqual(s.sent.actions[i].p3, 10);
+        assert.strictEqual(s.sent.actions[i].data.toKeyString(), 'a');
+    }
+    // Only the first queue step ran before any packet: every packet saw the same step number.
+    assert.deepStrictEqual(plain(s.sendSteps), [0, 0, 0, 0]);
+    assert.strictEqual(def.dropped(), 10);
+});
+
+t.test('adventureBurst logs one burst line with the grids, the stack and the need', function () {
+    var s = burstWorld(10, [4, 3, 2, 1]);
+    s.H.clearLogs();
+    var def = s.buffs.adventureBurst('ItemA', [7, 8, 9, 10], 10, { need: 10 });
+    def.retries = 0;
+    run(s, def);
+    var lines = bursts(s);
+    assert.strictEqual(lines.length, 1);
+    var text = JSON.stringify(lines[0]);
+    assert.ok(/item ItemA burst x10 -> 4 grid\(s\): 7@\+\d+, 8@\+\d+, 9@\+\d+, 10@\+\d+/.test(text), text);
+    assert.ok(text.indexOf('stack 10[a]') !== -1, text);
+    assert.ok(text.indexOf('stock 10') !== -1, text);
+    assert.ok(text.indexOf('need 10') !== -1, text);
+    assert.ok(/first at \d\d:\d\d:\d\d\.\d{3}/.test(text), text);
+});
+
+t.test('adventureBurst with quietMs is not verified before the quiet time, then reports the total drop', function () {
+    var s = burstWorld(10);
+    var gapMs = s.S.kernel.TIMEOUTS.QUEUE_ACTION_GAP_MS;
+    var def = s.buffs.adventureBurst('ItemA', [7, 8], 10, { need: 10, quietMs: 15000 });
+    assert.strictEqual(def.checkAfterMs, 15000);
+    assert.strictEqual(def.timeoutMs, 30000);
+    def.retries = 0;
+    // The game takes 4 and 3 of the 10 offered to each grid.
+    var takes = [4, 3];
+    var n = 0;
+    s.env.onSend = function () { s.buff.amount -= takes[n++]; };
+    var r = runSteps(s, def);
+    assert.strictEqual(r.res.status, s.S.ActionResult.Verified);
+    // One send step, then the polls of the quiet time, the last of which reads.
+    assert.strictEqual(r.doneAt, 1 + Math.ceil(15000 / gapMs));
+    assert.strictEqual(def.dropped(), 7);
+});
+
+t.test('adventureBurst without quietMs sets no checkAfterMs and verifies on the first poll', function () {
+    var s = burstWorld(10, [5, 5]);
+    var def = s.buffs.adventureBurst('ItemA', [7, 8], 10, { need: 10 });
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(def, 'checkAfterMs'), false);
+    def.retries = 0;
+    var r = runSteps(s, def);
+    assert.strictEqual(r.res.status, s.S.ActionResult.Verified);
+    assert.strictEqual(r.doneAt, 2);
+});
+
+t.test('adventureBurst refuses each bad input before any packet', function () {
+    var s = acting({ buffs: [
+        { type: 'ItemA', amount: 6, uid: 'a' },
+        { type: 'ItemA', amount: 4, uid: 'b' }
+    ] });
+    assert.strictEqual(run(s, s.buffs.adventureBurst('ItemA', [7, 0], 1)).reason, 'no target grid');
+    assert.strictEqual(run(s, s.buffs.adventureBurst('ItemA', [], 1)).reason, 'no target grid');
+    assert.strictEqual(run(s, s.buffs.adventureBurst('ItemA', [7, 8], 0)).reason, 'invalid amount');
+    assert.strictEqual(run(s, s.buffs.adventureBurst('ItemA', [7, 8], 5, { need: 4 })).reason, 'invalid amount');
+    assert.strictEqual(run(s, s.buffs.adventureBurst('ItemA', [7, 8], 10, { need: 11 })).reason, 'not enough in stock');
+    assert.strictEqual(run(s, s.buffs.adventureBurst('ItemA', [7, 8], 10, { need: 10 })).reason, 'no single stack of 10');
+    assert.strictEqual(s.sent.actions.length, 0);
+});
+
+t.test('adventureBurst: any grid with another building sends nothing and names that grid', function () {
+    var s = acting({ buffs: [{ type: 'ItemA', amount: 20, uid: 'a' }] });
+    s.env.buildings[7] = standing('A');
+    s.env.buildings[8] = standing('B');
+    s.env.buildings[9] = standing('C');
+    s.H.clearLogs();
+    var def = s.buffs.adventureBurst('ItemA', [7, 8, 9], 10, { buildings: ['A', 'A', 'C'] });
+    def.retries = 0;
+    var res = run(s, def);
+    assert.strictEqual(res.status, s.S.ActionResult.Refused);
+    assert.strictEqual(res.reason, 'nothing sent');
+    assert.strictEqual(s.sent.actions.length, 0);
+    assert.strictEqual(notSentWarns(s, '8 (was A, now B)').length, 1);
+    assert.strictEqual(notSentWarns(s, '7 (was').length, 0);
+    assert.strictEqual(bursts(s).length, 0);
+});
+
+t.test('adventureBurst: every building as chosen sends the whole burst', function () {
+    var s = burstWorld(20);
+    s.env.buildings[7] = standing('A');
+    var def = s.buffs.adventureBurst('ItemA', [7, 8], 10, { buildings: ['A', ''], need: 10 });
+    def.retries = 0;
+    var res = run(s, def);
+    assert.strictEqual(res.status, s.S.ActionResult.Verified);
+    assert.strictEqual(s.sent.actions.length, 2);
+});
+
+t.test('adventureBurst: a failing second packet stops the burst and is a send failure', function () {
+    var s = acting({ buffs: [{ type: 'ItemA', amount: 20, uid: 'a' }] });
+    var gi = s.H.host.game.gi;
+    var real = gi.SendServerAction;
+    var calls = 0;
+    gi.SendServerAction = function () {
+        calls++;
+        if (calls === 2) throw new Error('boom');
+        return real.apply(this, arguments);
+    };
+    s.H.clearLogs();
+    var def = s.buffs.adventureBurst('ItemA', [7, 8, 9], 5, { need: 5 });
+    def.retries = 0;
+    var res = run(s, def);
+    assert.strictEqual(res.status, s.S.ActionResult.Failed);
+    assert.strictEqual(res.reason, 'send failed');
+    assert.strictEqual(s.sent.actions.length, 1);
+    assert.strictEqual(calls, 2);
+    var lines = bursts(s);
+    assert.strictEqual(lines.length, 1);
+    var text = JSON.stringify(lines[0]);
+    assert.ok(/7@\+\d+; 8 failed; not sent 9/.test(text), text);
+});
+
+t.test('adventureBurst: the baseline comes from the precheck, so a missed re-read cannot hide the drop', function () {
+    var buff = { type: 'ItemA', amount: 20, uid: 'a' };
+    var s = acting({ buffs: [buff] });
+    s.env.onSend = function (a) { buff.amount -= a.p3; };
+    var player = s.H.host.game.gi.mCurrentPlayer;
+    var menu = player.getAvailableBuffs_vector;
+    var reads = 0;
+    // Read 1 is the precheck. Read 2, where the baseline used to be read, is missed.
+    player.getAvailableBuffs_vector = function () {
+        reads++;
+        return reads === 2 ? undefined : menu.apply(this, arguments);
+    };
+    var def = s.buffs.adventureBurst('ItemA', [7, 8], 10, { need: 10 });
+    def.retries = 0;
+    var res = run(s, def);
+    assert.strictEqual(res.status, s.S.ActionResult.Verified);
+    assert.strictEqual(def.dropped(), 20);
+    assert.strictEqual(s.sent.actions.length, 2);
+});
+
+t.test('adventureBurst describe lists the buffs per grid, ? where unreadable', function () {
+    var buff = { type: 'ItemA', amount: 20, uid: 'a' };
+    var s = acting({ buffs: [buff] });
+    s.env.buildings[7] = { GetBuildingName_string: function () { return 'A'; }, mBuffs_vector: [1, 2] };
+    s.env.onSend = function (a) { buff.amount -= a.p3; };
+    var def = s.buffs.adventureBurst('ItemA', [7, 8], 10, { buildings: ['A', ''], need: 10 });
+    def.retries = 0;
+    run(s, def);
+    assert.strictEqual(def.describe({ stock: 20 }), 'stock 20 -> 0; buffs 7:2,8:?');
+    s.S.core.buildings.byGrid = function () { throw new Error('boom'); };
+    assert.strictEqual(def.describe({ stock: 20 }), 'stock 20 -> 0; buffs 7:?,8:?');
 });
