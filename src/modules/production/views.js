@@ -35,7 +35,7 @@
         }
     }
 
-    function isNum(n) { return typeof n === 'number' && isFinite(n); }
+    function isNum(n) { return S.kernel.is.finite(n); }
 
     function at(h, ms) {
         return isNum(ms) ? h.clock(new Date(ms)) : '';

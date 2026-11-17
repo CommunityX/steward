@@ -73,9 +73,7 @@
     function M() { return S.modules.production; }
     function H() { return S.kernel.ui.helpers; }
 
-    function has(o, k) {
-        return Object.prototype.hasOwnProperty.call(o, k);
-    }
+    function has(o, k) { return S.kernel.is.has(o, k); }
 
     function textEl(tag, cls, text) {
         var $e = $('<' + tag + '>');
