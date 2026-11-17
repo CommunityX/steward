@@ -29,11 +29,6 @@
         S.kernel.settings.write('explorers', s);
     }
 
-    function notify(text) {
-        try { if (typeof showGameAlert === 'function') showGameAlert('Steward: ' + text); }
-        catch (e) { /* best effort */ }
-    }
-
     // Runs-now button: dump explorer state + per-explorer pickTask results
     // to the log. Helps users tune overrides before flipping `enabled`.
     function showOverrides() {
@@ -75,7 +70,7 @@
         var read = listExplorers();
         if (!read.has) {
             S.kernel.log('explorers', 'explorers not readable yet:', S.kernel.read.show(read.r));
-            return notify('Explorers are still being read — try again in a moment.');
+            return S.kernel.ui.notify('Explorers are still being read — try again in a moment.');
         }
         var explorers = read.list;
 
@@ -97,7 +92,7 @@
                 '→ pickTask:', picked,
                 override ? ('(override: ' + override + ')') : '');
         }
-        notify('Explorer state dumped to log.');
+        S.kernel.ui.notify('Explorer state dumped to log.');
     }
 
     // Build dropdown options for the "Default task" picker. Values are
