@@ -80,6 +80,18 @@
         return result;
     }
 
+    // Result form of byType for callers that must tell "no deposits" (ok,
+    // empty) from "could not look" (unreadable, why = the error text). byType
+    // keeps throwing for the callers that rely on it.
+    function byTypeRead(typeName, opts) {
+        var R = S.kernel.read;
+        try {
+            return R.ok(byType(typeName, opts));
+        } catch (e) {
+            return R.unreadable(R.message(e));
+        }
+    }
+
     // Built from byType over the deposit-type enum, so a failed read of any
     // type propagates instead of shrinking the list.
     function list(opts) {
@@ -100,13 +112,16 @@
         return null;
     }
 
+    // Depleted deposits surface as buildings whose name starts with "Depleted".
+    function isDepletedName(bn) {
+        return typeof bn === 'string' && bn.indexOf('Depleted') === 0;
+    }
+
     function depleted(opts) {
         opts = opts || {};
-        // Depleted deposits surface as buildings whose name starts with "Depleted".
         if (!S.core.buildings) return [];
         return S.core.buildings.byPredicate(function (b) {
-            var bn = S.core.buildings.name(b);
-            return typeof bn === 'string' && bn.indexOf('Depleted') === 0;
+            return isDepletedName(S.core.buildings.name(b));
         }, opts);
     }
 
@@ -115,7 +130,7 @@
     function isManagedDepleted(b) {
         if (!S.core.buildings) return false;
         var bn = S.core.buildings.name(b);
-        if (typeof bn !== 'string' || bn.indexOf('Depleted') !== 0) return false;
+        if (!isDepletedName(bn)) return false;
         var rows = S.core.deposits.types();
         for (var i = 0; i < rows.length; i++) {
             if (bn.indexOf(rows[i].name) > 0) return true;
@@ -130,6 +145,22 @@
             if (isManagedDepleted(all[i])) out.push(all[i]);
         }
         return out;
+    }
+
+    // Result form of depletedManaged: the building list's own state is
+    // carried over, so a list that is loading or unreadable is never read as
+    // "nothing depleted".
+    function depletedManagedRead() {
+        var R = S.kernel.read;
+        if (!S.core.buildings) return R.ok([]);
+        var r = S.core.buildings.listRead();
+        if (!R.has(r)) return r;
+        var out = [];
+        for (var i = 0; i < r.value.length; i++) {
+            if (isManagedDepleted(r.value[i])) out.push(r.value[i]);
+        }
+        if (r.state === R.PARTIAL) return R.partial(out, r.lost, r.why, r.zoneId);
+        return R.ok(out, r.zoneId);
     }
 
     // Sends the destruct command for one depleted deposit on the home zone.
@@ -158,6 +189,8 @@
     if (!S.core.deposits) S.core.deposits = {};
     S.core.deposits.list     = list;
     S.core.deposits.byType   = byType;
+    S.core.deposits.byTypeRead = byTypeRead;
+    S.core.deposits.depletedManagedRead = depletedManagedRead;
     S.core.deposits.byGrid   = byGrid;
     S.core.deposits.depleted = depleted;
     S.core.deposits.isManagedDepleted = isManagedDepleted;
