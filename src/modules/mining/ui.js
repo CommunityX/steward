@@ -95,7 +95,7 @@
 
     // Buildings and buffed buildings over every deposit type, masons included.
     function buffTotals() {
-        var types = depositTypes();
+        var types = S.core.deposits.types();
         var out = { buffed: 0, buildings: 0 };
         for (var i = 0; i < types.length; i++) {
             out.buffed    += buffedCount(types[i]);
@@ -116,14 +116,8 @@
         };
     }
 
-    function depositTypes() {
-        var d = S.core.deposits;
-        if (!d || !d.types) return [];
-        return d.types() || [];
-    }
-
     function pausedCount(s) {
-        var types = depositTypes();
+        var types = S.core.deposits.types();
         var n = 0;
         for (var i = 0; i < types.length; i++) {
             var cfg = (s.deposits || {})[types[i].name];
@@ -133,7 +127,7 @@
     }
 
     function minesActive() {
-        var types = depositTypes();
+        var types = S.core.deposits.types();
         var n = 0;
         for (var i = 0; i < types.length; i++) {
             if (types[i].mineName) n += activeCount(types[i]);
@@ -251,7 +245,7 @@
     function render($main, h) {
         h.baseline('mining', readSettings());
         var s = shownSettings(h);
-        var types = depositTypes();
+        var types = S.core.deposits.types();
         var depCfg = s.deposits || {};
 
         var mineRows = [];
