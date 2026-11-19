@@ -15,7 +15,9 @@
  * entry count and the maps for the entry Start would begin with: the first
  * entry, or with the queue's no-map skip the first entry that has a map. Like
  * a scenario row it is greyed with no map. Both kinds of entry are read once,
- * when the menu is built, so a status pass reads no file.
+ * when the menu is built, so a status pass reads no file. While the star menu
+ * or the own adventures cannot be read the label says "(reading...)" instead
+ * of a count, and the row keeps its last readable state.
  *
  * Where an adventure belongs comes from S.core.adventures.folderPath (host
  * type, campaign and requiresEvent, with an Other fallback that names the
@@ -28,8 +30,8 @@
  *
  * Every template and scenario row is labelled with the maps available for
  * its adventure and is greyed when there is none. A pass where the star menu
- * cannot be read (×?) keeps the row's last readable state, so rows do not
- * flicker grey; a row never read yet is greyed. A click on a row that is
+ * cannot be read (the label says reading, as a queue row's does) keeps the
+ * row's last readable state, so rows do not flicker grey; a row never read yet is greyed. A click on a row that is
  * still enabled from an older reading ends in run.js's own notice. A
  * disabled row per broken scenario file sits last in Scenarios so the user
  * sees why it is missing.
@@ -131,11 +133,6 @@
         return parts.join('\n');
     }
 
-    // A map count of null means the star menu could not be read.
-    function countText(n) {
-        return n === null ? '?' : String(n);
-    }
-
     function mapsOf(adventure, pass) {
         var run = S.modules.adventures.run;
         return run ? run.available(adventure, pass) : 0;
@@ -149,12 +146,15 @@
         return countRow(text, function (pass) { return mapsOf(adventure, pass); }, onSelect);
     }
 
-    // The same row for a count that countOf(pass) works out.
+    // The same row for a count that countOf(pass) works out. While the count
+    // cannot be read the label shows the reading wording, never a count.
     function countRow(text, countOf, onSelect) {
         var on = false;
         return {
             label: function (pass) {
-                return text + ' ×' + countText(countOf(pass));
+                var n = countOf(pass);
+                if (n === null) return text + ' ' + readingText();
+                return text + ' ×' + n;
             },
             enabled: function (pass) {
                 var n = countOf(pass);
@@ -179,6 +179,14 @@
             var run = S.modules.adventures.run;
             if (run) run.startScenario(rec.id);
         });
+    }
+
+    // The shared wording of an unsettled read, for any row whose map count is
+    // not known yet; read at label time, since the helpers are not there
+    // while the menu file loads. '×?' only without them.
+    function readingText() {
+        var h = S.kernel.ui && S.kernel.ui.helpers;
+        return h && h.READING ? '(' + h.READING + ')' : '×?';
     }
 
     // The maps of the entry a queue's Start begins with (queues.startIndex).

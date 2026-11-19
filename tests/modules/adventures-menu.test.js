@@ -25,7 +25,7 @@ function def(name, type, campaign, requiresEvent) {
 }
 
 // An adventure manager with no open adventures: an own list that cannot be read
-// keeps the map count unknown (×?), so rows need a readable, empty one.
+// keeps the map count unknown (reading), so rows need a readable, empty one.
 function emptyOwn(H) {
     var prev = H.host.game.def;
     H.host.game.def = function (name) {
@@ -211,7 +211,7 @@ t.test('an unreadable pass keeps the last readable enabled state and a never-rea
     assert.strictEqual(enabledOf(row, {}), true);
     s.S.core.buffs.mapCounts = unreadable;
     assert.strictEqual(enabledOf(row, {}), true);
-    assert.strictEqual(labelOf(row, {}), 'Alpha ×?');
+    assert.strictEqual(labelOf(row, {}), 'Alpha (reading...)');
     s.maps.AdvA = 0;
     s.S.core.buffs.mapCounts = s.counts;
     assert.strictEqual(enabledOf(row, {}), false);
@@ -219,7 +219,7 @@ t.test('an unreadable pass keeps the last readable enabled state and a never-rea
     assert.strictEqual(enabledOf(row, {}), false);
     var fresh = s.menu.items()[FIXED].items[0];
     assert.strictEqual(enabledOf(fresh, {}), false);
-    assert.strictEqual(labelOf(fresh, {}), 'Alpha ×?');
+    assert.strictEqual(labelOf(fresh, {}), 'Alpha (reading...)');
 });
 
 t.test('label and enabled share one star-menu read per pass', function () {
@@ -370,6 +370,37 @@ t.test('a queue with no-map skip shows the maps of the first entry that has one'
     var q = queuesFolder(s.menu.items());
     assert.deepStrictEqual(plain(labels(q.item.items)), ['Skipper (2 entries) ×3']);
     assert.strictEqual(enabledOf(q.item.items[0], {}), true);
+});
+
+// An adventure manager whose list cannot be read: the own list is unreadable.
+function unreadableOwn(H) {
+    var prev = H.host.game.def;
+    H.host.game.def = function (name) {
+        if (name === 'com.bluebyte.tso.adventure.logic::AdventureManager') {
+            return { getInstance: function () { return {
+                getAdventures: function () { return null; },
+                isMyAdventure: function () { return true; }
+            }; } };
+        }
+        return prev(name);
+    };
+}
+
+t.test('a queue row says reading while the star menu or the own list cannot be read', function () {
+    var s = setup({ maps: { AdvA: 2 }, defs: [def('AdvA', 'Mission')] });
+    var a = saveTpl(s, 'Alpha', 'AdvA');
+    saveQueue(s, 'Solo', [a]);
+    var row = queuesFolder(s.menu.items()).item.items[0];
+    assert.strictEqual(enabledOf(row, {}), true);
+    s.S.core.buffs.mapCounts = function () { return null; };
+    assert.strictEqual(labelOf(row, {}), 'Solo (1 entry) (reading...)', 'never a count or ?');
+    assert.strictEqual(enabledOf(row, {}), true, 'the last readable state stays');
+    s.S.core.buffs.mapCounts = s.counts;
+    unreadableOwn(s.H);
+    assert.strictEqual(labelOf(row, {}), 'Solo (1 entry) (reading...)', 'an unreadable own list is no 0 maps');
+    assert.strictEqual(enabledOf(row, {}), true);
+    emptyOwn(s.H);
+    assert.strictEqual(labelOf(row, {}), 'Solo (1 entry) ×2');
 });
 
 t.test('a queue row starts the queue and a broken file is a disabled row last', function () {
