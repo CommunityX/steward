@@ -792,6 +792,7 @@
         plan:     plan,
         ui: {
             tab: 'production',
+            dashboard: S.Dashboard.Economy,
             section: {
                 id:    'production',
                 title: 'Production',
